@@ -1,5 +1,4 @@
 import torch
-# Fix for the PyTorch 2.6+ security serialization error
 try:
     from ultralytics.nn.tasks import DetectionModel
     if hasattr(torch.serialization, 'add_safe_globals'):
@@ -17,143 +16,87 @@ import re
 import os
 from rapidfuzz import fuzz
 
-# --- UI CONFIGURATION ---
-st.set_page_config(page_title="Legal Metrology Compliance AI", layout="wide", page_icon="⚖️")
+# --- UI CONFIG ---
+st.set_page_config(page_title="Fast Metrology AI", layout="wide")
 
-# Professional UI Styling for SIH Presentation
 st.markdown("""
     <style>
-    .main { background-color: #f8f9fa; }
-    .report-card { 
-        background: white; padding: 20px; border-radius: 12px; 
-        border-left: 10px solid #004085; color: #111111 !important;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px;
-    }
-    .status-pass { color: #28a745 !important; font-weight: bold; font-size: 1.2em; }
-    .status-fail { color: #dc3545 !important; font-weight: bold; font-size: 1.2em; }
-    .card-title { color: #004085 !important; font-weight: bold; font-size: 1.3em; }
-    .header-style { color: #004085; font-weight: bold; border-bottom: 2px solid #004085; padding-bottom: 10px; }
+    .report-card { background: white; padding: 15px; border-radius: 10px; border-left: 8px solid #004085; color: black; margin-bottom: 10px; }
+    .status-pass { color: #28a745 !important; font-weight: bold; }
+    .status-fail { color: #dc3545 !important; font-weight: bold; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- AI MODELS ---
+# --- MODELS ---
 @st.cache_resource
 def load_ai():
-    # Priority: Trained model (best.pt) > Default model (yolov8n.pt)
+    # Load Nano model (Fastest version)
     model = YOLO('best.pt') if os.path.exists('best.pt') else YOLO('yolov8n.pt')
-    # gpu=False ensures stability on CPU-only Streamlit Cloud instances
-    reader = easyocr.Reader(['en'], gpu=False)
+    reader = easyocr.Reader(['en'], gpu=False) # Cloud is CPU only
     return model, reader
 
 detector, reader = load_ai()
 
-# --- OCR POST-PROCESSING ---
-def repair_numbers(text):
-    text = text.lower()
-    # Post-processing map to fix common OCR character swaps on curved packaging
-    mapping = {'s': '5', 'o': '0', 'i': '1', 'l': '1', 'b': '8', 'z': '2'}
-    if any(char.isdigit() for char in text) or len(text) <= 4:
-        for char, num in mapping.items():
-            text = text.replace(char, num)
-    return text
-
-def enhance_image(img):
-    # Convert to grayscale for OCR engine optimization
+# --- OPTIMIZED PROCESSING ---
+def fast_enhance(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # 3x Zoom (Super-resolution) to handle micro-fonts on small containers
-    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_LANCZOS4)
-    # Adaptive thresholding to eliminate shadows and plastic glare
-    enhanced = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    return enhanced
+    # Reduced zoom from 3x to 1.5x for speed
+    gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
+    return gray
 
-# --- COMPLIANCE ENGINE ---
 def check_compliance(extracted_list):
     raw_blob = " ".join(extracted_list).lower()
-    
-    # 1. Price Verification
-    price_marker = any(x in raw_blob for x in ['mrp', 'rs', 'price', 'retail', '₹', 'r5'])
-    # Search for digits after repairing common swaps (e.g., S00 -> 500)
-    digits_found = re.search(r"\d{2,}", repair_numbers(raw_blob))
-    price_pass = price_marker and digits_found
-
-    # 2. Tax Declaration (Fuzzy Matching Logic)
-    # Required: 'Inclusive of all taxes' or variants like 'Incl. of all taxes'
-    tax_score = fuzz.partial_ratio("inclusive of all taxes", raw_blob)
-    tax_fragments = ["incl", "tax", "inc", "all", "taxes"]
-    tax_pass = (tax_score > 45) or any(f in raw_blob for f in tax_fragments)
-
-    # 3. Net Quantity Verification
+    mrp_pass = (fuzz.partial_ratio("inclusive of all taxes", raw_blob) > 50) or \
+               (any(x in raw_blob for x in ['mrp', 'rs', 'price', '₹']) and re.search(r"\d{2,}", raw_blob))
     qty_pass = re.search(r"\d+\s?(ml|g|kg|l|n|unit|pcs|gm)", raw_blob)
-
-    # 4. Manufacturing/Packing Date
-    date_pass = re.search(r"(\d{2}[/\-\.]\d{2,4})", raw_blob) or "mfg" in raw_blob or "pkd" in raw_blob
-
+    date_pass = re.search(r"(\d{2}[/\-\.]\d{2,4})", raw_blob) or "mfg" in raw_blob
+    
     return {
-        "MRP & Price Declaration": (bool(price_pass), "Rule 6: Mandatory MRP keyword and numeric price value"),
-        "Tax Declaration": (bool(tax_pass), "Rule 6: Mandatory 'Inclusive of all taxes' phrase"),
-        "Net Quantity": (bool(qty_pass), "Rule 7: Weight or Volume in standard metric units"),
-        "Mfg/Packing Date": (bool(date_pass), "Rule 9: Month and Year of manufacture/packing")
+        "MRP & Taxes": (bool(mrp_pass), "MRP + Inclusive of all taxes"),
+        "Net Quantity": (bool(qty_pass), "Weight/Volume (e.g. 50ml)"),
+        "Mfg Date": (bool(date_pass), "Month/Year of packing")
     }
 
-# --- MAIN INTERFACE ---
-st.markdown("<h1 class='header-style'>⚖️ Legal Metrology Compliance AI</h1>", unsafe_allow_html=True)
-st.write("Intelligent Verification System for Packaged Commodities Rules, 2011.")
+# --- MAIN UI ---
+st.title("⚖️ Fast Legal Metrology AI")
 
-# Camera input for mobile-friendly scanning
-img_file = st.camera_input("Scan Product Label")
+img_file = st.camera_input("Scan Label")
 
 if img_file:
-    # 1. Load and Fix Orientation
-    image = ImageOps.exif_transpose(Image.open(img_file))
-    img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    # 1. Load and RESIZE immediately to save CPU cycles
+    raw_image = ImageOps.exif_transpose(Image.open(img_file))
+    img_np = np.array(raw_image)
+    h, w = img_np.shape[:2]
+    # Resize to 640px width (Standard YOLO size)
+    img_np = cv2.resize(img_np, (640, int(h * 640 / w)))
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
-    with st.spinner("AI Analysis in Progress..."):
-        # 2. YOLO Inference (Sensitivity fixed at 0.05 for maximum detection)
-        results = detector(img_bgr, conf=0.05)
+    with st.spinner("Fast Analysis..."):
+        # 2. YOLO Inference (Faster on small image)
+        results = detector(img_bgr, conf=0.10)
         detected_texts = []
         
-        # 3. Targeted OCR (Zone Processing)
+        # 3. Smart OCR Logic
         if len(results[0].boxes) > 0:
             for box in results[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                # Apply 40px Padding to ensure full strings are captured
-                x1, y1, x2, y2 = max(0, x1-40), max(0, y1-40), min(img_bgr.shape[1], x2+40), min(img_bgr.shape[0], y2+40)
-                
+                # Small 10px padding
+                x1, y1, x2, y2 = max(0, x1-10), max(0, y1-10), min(img_bgr.shape[1], x2+10), min(img_bgr.shape[0], y2+10)
                 crop = img_bgr[y1:y2, x1:x2]
-                ocr_out = reader.readtext(enhance_image(crop), detail=0)
-                detected_texts.extend(ocr_out)
-        
-        # 4. Fallback Full-Frame Scan (Heuristic Backup)
-        detected_texts.extend(reader.readtext(enhance_image(img_bgr), detail=0))
+                # Fast OCR with paragraph mode
+                txt = reader.readtext(fast_enhance(crop), detail=0, paragraph=True)
+                detected_texts.extend(txt)
+        else:
+            # Only run full scan if YOLO finds nothing (Saves time)
+            detected_texts = reader.readtext(fast_enhance(img_bgr), detail=0, paragraph=True)
 
-        # --- RESULTS VISUALIZATION ---
-        col_vis, col_rep = st.columns(2)
-        
-        with col_vis:
-            st.subheader("Neural Detection View")
-            # Convert BGR (OpenCV) to RGB (Streamlit)
-            res_plotted = results[0].plot()
-            st.image(cv2.cvtColor(res_plotted, cv2.COLOR_BGR2RGB), use_container_width=True)
-            
-        with col_rep:
-            st.subheader("Compliance Report")
+        # 4. Results
+        col1, col2 = st.columns(2)
+        with col1:
+            st.image(cv2.cvtColor(results[0].plot(), cv2.COLOR_BGR2RGB), use_container_width=True)
+        with col2:
             report = check_compliance(detected_texts)
-            
             for rule, (status, desc) in report.items():
-                s_icon = "PASSED ✅" if status else "FAILED ❌"
+                s_icon = "✅ PASS" if status else "❌ FAIL"
                 s_class = "status-pass" if status else "status-fail"
-                
-                st.markdown(f"""
-                    <div class="report-card">
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <span class="card-title">{rule}</span>
-                            <span class="{s_class}">{s_icon}</span>
-                        </div>
-                        <hr style="margin: 10px 0; border: 0; border-top: 1px solid #eeeeee;">
-                        <small><b>Requirement:</b> {desc}</small>
-                    </div>
-                """, unsafe_allow_html=True)
-
-# --- FOOTER ---
-st.divider()
-st.caption("Smart India Hackathon 2024 | Prototype for Legal Metrology Regulatory Compliance.")
+                st.markdown(f'<div class="report-card"><b>{rule}</b>: <span class="{s_class}">{s_icon}</span><br><small>{desc}</small></div>', unsafe_allow_html=True)
