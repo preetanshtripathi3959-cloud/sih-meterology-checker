@@ -1,3 +1,13 @@
+import torch
+
+# FIX: Allow YOLOv8 classes to load in newer PyTorch versions
+try:
+    from ultralytics.nn.tasks import DetectionModel
+    # This tells PyTorch that the YOLO model structure is safe to load
+    if hasattr(torch.serialization, 'add_safe_globals'):
+        torch.serialization.add_safe_globals([DetectionModel])
+except Exception:
+    pass
 import streamlit as st
 import cv2
 import numpy as np
