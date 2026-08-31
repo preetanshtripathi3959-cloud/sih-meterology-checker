@@ -20,84 +20,95 @@ st.markdown("""
 # --- MODELS ---
 @st.cache_resource
 def load_ai_models():
-    # Detection Stage: YOLOv8
+    # Only use YOLO if custom trained 'best.pt' exists
     try:
-        detector = YOLO('best.pt') # Your trained model
+        detector = YOLO('best.pt') 
+        has_custom_yolo = True
     except:
-        detector = YOLO('yolov8n.pt') # Fallback
+        detector = None
+        has_custom_yolo = False
     
-    # Recognition Stage: OCR
-    reader = easyocr.Reader(['en'])
-    return detector, reader
+    # Initialize EasyOCR
+    reader = easyocr.Reader(['en'], gpu=False)
+    return detector, reader, has_custom_yolo
 
-detector, reader = load_ai_models()
+detector, reader, has_custom_yolo = load_ai_models()
 
-# --- THE OCR PIPELINE FUNCTION ---
+# --- OCR PIPELINE FUNCTION ---
 def run_smart_ocr(img_bgr):
-    # Step 1: Detect Text Blocks using YOLO
-    results = detector(img_bgr, conf=0.3)
-    
-    all_extracted_text = []
-    
-    # Step 2: Loop through detected blocks and run OCR on each
-    if len(results[0].boxes) > 0:
-        for box in results[0].boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            # Crop the detection for OCR
-            crop = img_bgr[y1:y2, x1:x2]
-            # Convert to gray for better OCR recognition
-            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            # Recognize text in the crop
-            text = reader.readtext(gray_crop, detail=0)
-            all_extracted_text.extend(text)
-    else:
-        # Fallback: OCR the whole image if no blocks detected
-        all_extracted_text = reader.readtext(img_bgr, detail=0)
-        
-    return all_extracted_text, results[0].plot()
+    extracted_text = []
+    annotated_img = img_bgr.copy()
+
+    # 1. Full Horizontal Image OCR
+    full_text_horiz = reader.readtext(img_bgr, detail=0)
+    extracted_text.extend(full_text_horiz)
+
+    # 2. Rotated Image OCR (To capture vertical text on borders like "NET CONTENT: 100 ml")
+    img_rotated = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    full_text_vert = reader.readtext(img_rotated, detail=0)
+    extracted_text.extend(full_text_vert)
+
+    # 3. Run Custom YOLO model if available
+    if has_custom_yolo and detector is not None:
+        results = detector(img_bgr, conf=0.3)
+        if len(results[0].boxes) > 0:
+            annotated_img = results[0].plot()
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                crop = img_bgr[y1:y2, x1:x2]
+                if crop.size > 0:
+                    gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                    text = reader.readtext(gray_crop, detail=0)
+                    extracted_text.extend(text)
+
+    # Deduplicate extracted lines
+    unique_text = list(dict.fromkeys(extracted_text))
+    return unique_text, annotated_img
 
 # --- COMPLIANCE ENGINE ---
 def check_rules(text_list):
     full_text = " ".join(text_list).lower()
     
-    # Matching rules from Legal Metrology Act
+    # 1. Check MRP & Tax Inclusions
+    has_mrp_kw = bool(re.search(r"(mrp|rs|retail|price|\u20b9)", full_text))
+    has_tax_kw = bool(re.search(r"(incl|inclusive|tax|taxes)", full_text))
+    mrp_status = has_mrp_kw and has_tax_kw
+
+    # 2. Check Net Quantity (Flexible match for numbers + units like 100 ml, 100ml, g, kg)
+    net_qty_status = bool(re.search(r"(\b\d+(\.\d+)?\s*(g|kg|ml|l|unit|pcs|n)\b)|(net\s*content)|(net\s*qty)", full_text))
+
+    # 3. Check Mfg / Pkd / Expiry Date
+    date_status = bool(re.search(r"(\d{2}/\d{2,4})|(mfd|pkd|mfg|batch|best before|exp)", full_text))
+
     report = {
-        "MRP & Taxes": (re.search(r"(mrp|rs|retail|price).?\d+", full_text) and "incl" in full_text, 
-                        "Rule 6: MRP must include 'Inclusive of all taxes'"),
-        "Net Quantity": (re.search(r"(\d+)\s?(g|kg|ml|l|unit|n)", full_text), 
-                        "Rule 7: Standard units (g, kg, ml, l) are mandatory"),
-        "Mfg/Pkd Date": (re.search(r"\d{2}/\d{2,4}", full_text) or "pkd" in full_text, 
-                        "Rule 9: Month and Year of packing must be declared")
+        "MRP & Taxes": (mrp_status, "Rule 6: MRP declaration must include 'Inclusive of all taxes'"),
+        "Net Quantity": (net_qty_status, "Rule 7: Standard declaration of Net Quantity (g, kg, ml, l)"),
+        "Mfg/Pkd Date": (date_status, "Rule 9: Month & Year of packing/manufacture must be declared")
     }
     return report
 
 # --- UI LAYOUT ---
 st.title("🛡️ Automated Metrology Compliance")
-st.write("Target: Problem Statement - Automated Compliance for Packaged Commodities")
+st.write("Target: Automated Compliance Verification for Packaged Goods")
 
 img_input = st.camera_input("Scan Product Label")
 
 if img_input:
-    # Prepare Image
     image = Image.open(img_input)
     img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     
-    with st.spinner("AI Pipeline: Detecting ➔ Recognizing ➔ Verifying..."):
-        # Run the Two-Stage OCR
+    with st.spinner("Analyzing image, scanning angles, and verifying compliance..."):
         extracted_text, annotated_img = run_smart_ocr(img_bgr)
-        
-        # Verify Rules
         compliance_results = check_rules(extracted_text)
         
-        # Display Results
         col1, col2 = st.columns(2)
         
         with col1:
-            st.subheader("1. AI Detection")
-            st.image(cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB), caption="YOLOv8 Detected Zones")
+            st.subheader("1. Processing View")
+            st.image(cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB), caption="Scanned Region")
             
         with col2:
-            st.subheader("2. OCR & Compliance Report")
+            st.subheader("2. Compliance Report")
             for rule, (status, desc) in compliance_results.items():
                 st_icon = "✅" if status else "❌"
                 st_color = "status-pass" if status else "status-fail"
@@ -109,5 +120,5 @@ if img_input:
                     </div>
                 """, unsafe_allow_html=True)
 
-    with st.expander("Show Extracted OCR Text"):
+    with st.expander("Show Raw Extracted OCR Text"):
         st.write(extracted_text)
