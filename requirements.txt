@@ -1,6 +1,7 @@
 streamlit
+ultralytics
 easyocr
 opencv-python-headless
-pillow
-numpy
 rapidfuzz
+Pillow
+numpy
