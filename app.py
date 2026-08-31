@@ -6,11 +6,11 @@ import numpy as np
 from PIL import Image
 import re
 import os
+from rapidfuzz import fuzz
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="SIH AI Inspector", layout="wide")
+# --- UI CONFIG ---
+st.set_page_config(page_title="SIH Compliance AI", layout="wide")
 
-# --- UI STYLING ---
 st.markdown("""
     <style>
     .report-card { background: white; padding: 15px; border-radius: 10px; border-left: 10px solid #004085; color: black; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
@@ -19,100 +19,88 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- SIDEBAR DIAGNOSTICS ---
-st.sidebar.title("🛠️ AI Debugger")
-conf_threshold = st.sidebar.slider("AI Confidence Threshold", 0.0, 1.0, 0.15)
-st.sidebar.info("Lower this slider if no boxes appear.")
-
 # --- LOAD MODELS ---
 @st.cache_resource
 def load_models():
-    # 1. Check if best.pt exists
     if os.path.exists('best.pt'):
-        try:
-            model = YOLO('best.pt')
-            status = "✅ Custom Model (best.pt) Loaded"
-            classes = model.names
-        except Exception as e:
-            model = YOLO('yolov8n.pt')
-            status = f"❌ Error loading best.pt: {e}"
-            classes = "N/A"
+        model = YOLO('best.pt')
+        status = "✅ Custom Model Loaded"
     else:
         model = YOLO('yolov8n.pt')
-        status = "⚠️ best.pt NOT FOUND. Using default model."
-        classes = "N/A"
-        
+        status = "⚠️ Generic Model Loaded"
     reader = easyocr.Reader(['en'])
-    return model, reader, status, classes
+    return model, reader, status
 
-detector, reader, model_status, model_classes = load_models()
+detector, reader, model_status = load_models()
 
-st.sidebar.write(f"**Status:** {model_status}")
-st.sidebar.write(f"**Detected Classes:** {model_classes}")
+# --- SIDEBAR ---
+st.sidebar.title("🛠️ AI Debugger")
+conf_val = st.sidebar.slider("Confidence", 0.0, 1.0, 0.35) # Raised to 0.35 to avoid detecting faces/shirts
+st.sidebar.write(f"Model: {model_status}")
 
-# --- MAIN UI ---
-st.title("🛡️ Legal Metrology Compliance AI")
-st.write("Scan labels to verify MRP, Dates, and Quantity.")
+# --- UPDATED COMPLIANCE LOGIC (Better Regex) ---
+def check_compliance(text_list):
+    full_text = " ".join(text_list).lower()
+    
+    # 1. MRP & Taxes: Look for MRP keyword and 'inclusive'
+    mrp_found = re.search(r"(mrp|rs|retail|price).?\s?\d+", full_text)
+    tax_phrase = fuzz.partial_ratio("inclusive of all taxes", full_text) > 60
+    
+    # 2. Net Quantity: Handles "50ml", "1N", "1 N x 50ml"
+    qty_found = re.search(r"(\d+)\s?(g|kg|ml|l|unit|n|pcs)", full_text)
+    
+    # 3. Date: Handles 01-05-2026, 01/05/2026, 01.05.2026
+    date_found = re.search(r"(\d{2}[/\-\.]\d{2}[/\-\.]\d{2,4})", full_text) or "mfg" in full_text or "pkd" in full_text
 
-img_file = st.camera_input("Take a photo of the product label")
+    return {
+        "MRP & Taxes": (mrp_found and tax_phrase, "Required: MRP + 'inclusive of all taxes'"),
+        "Net Quantity": (bool(qty_found), "Required: Weight/Volume (e.g. 50ml)"),
+        "Mfg/Pkd Date": (bool(date_found), "Required: Month/Year (e.g. 05-2026)")
+    }
+
+# --- MAIN APP ---
+st.title("🛡️ Legal Metrology Inspector")
+img_file = st.camera_input("Scan Product Label")
 
 if img_file:
-    image = Image.open(img_file)
-    img_np = np.array(image)
-    # Convert RGB (Streamlit) to BGR (OpenCV/YOLO)
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    img = Image.open(img_file)
+    img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     
-    with st.spinner("Inference in progress..."):
-        # RUN DETECTION with the slider value
-        results = detector(img_bgr, conf=conf_threshold)
-        
+    with st.spinner("AI Processing..."):
+        results = detector(img_bgr, conf=conf_val)
         detected_texts = []
         
+        # If YOLO finds boxes, OCR them
         if len(results[0].boxes) > 0:
-            st.sidebar.success(f"Found {len(results[0].boxes)} objects!")
             for box in results[0].boxes:
-                # Crop and OCR
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 crop = img_bgr[y1:y2, x1:x2]
-                
-                # Pre-process crop for OCR accuracy
-                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-                enhanced = clahe.apply(gray)
-                
-                txt = reader.readtext(enhanced, detail=0)
+                # Light enhancement for OCR
+                crop = cv2.convertScaleAbs(crop, alpha=1.5, beta=0) 
+                txt = reader.readtext(crop, detail=0)
                 detected_texts.extend(txt)
-        else:
-            st.sidebar.error("No objects detected. Try lowering the Confidence Threshold.")
-            # Fallback to full page OCR
-            detected_texts = reader.readtext(img_np, detail=0)
+        
+        # FALLBACK: Always OCR the whole image too to ensure we don't miss anything!
+        full_page_text = reader.readtext(img_bgr, detail=0)
+        detected_texts.extend(full_page_text)
 
-    # --- DISPLAY ---
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("AI Vision")
-        # YOLO plot is BGR, convert to RGB for Streamlit
-        res_plotted = results[0].plot()
-        res_rgb = cv2.cvtColor(res_plotted, cv2.COLOR_BGR2RGB)
-        st.image(res_rgb, use_container_width=True)
-        
-    with col2:
-        st.subheader("Compliance Report")
-        full_text = " ".join(detected_texts).lower()
-        
-        # Rules Logic
-        mrp_ok = re.search(r"(mrp|rs|retail|price).?\d+", full_text) and ("incl" in full_text or "tax" in full_text)
-        qty_ok = re.search(r"(\d+)\s?(g|kg|ml|l|unit|n)", full_text)
-        date_ok = re.search(r"\d{2}/\d{2,4}", full_text) or "pkd" in full_text or "mfd" in full_text
+        # Remove duplicates while keeping order
+        detected_texts = list(dict.fromkeys(detected_texts))
 
-        checks = [("MRP & Taxes", mrp_ok), ("Net Quantity", qty_ok), ("Mfg/Pkd Date", date_ok)]
-        
-        for name, passed in checks:
-            color = "status-pass" if passed else "status-fail"
-            icon = "✅" if passed else "❌"
-            st.markdown(f'<div class="report-card"><b>{name}</b>: <span class="{color}">{icon} {"PASS" if passed else "FAIL"}</span></div>', unsafe_allow_html=True)
+        # Show Results
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("AI Vision")
+            res_plotted = results[0].plot()
+            st.image(cv2.cvtColor(res_plotted, cv2.COLOR_BGR2RGB))
             
-        with st.expander("Show Scanned Data"):
-            st.write(detected_texts)
+        with col2:
+            st.subheader("Compliance Report")
+            report = check_compliance(detected_texts)
+            for rule, (status, desc) in report.items():
+                st_color = "status-pass" if status else "status-fail"
+                st_icon = "✅" if status else "❌"
+                st.markdown(f'<div class="report-card"><b>{rule}</b>: <span class="{st_color}">{st_icon} {"PASS" if status else "FAIL"}</span><br><small>{desc}</small></div>', unsafe_allow_html=True)
+            
+            with st.expander("Show Scanned Text"):
+                st.write(detected_texts)
