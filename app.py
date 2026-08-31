@@ -130,4 +130,18 @@ if img_file:
 
             st.divider()
 
-            for rul
+            for rule, (status, desc) in report.items():
+                s_icon = "✅ PASS" if status else "❌ FAIL"
+                s_class = "status-pass" if status else "status-fail"
+                st.markdown(f"""
+                    <div class="report-card">
+                        <div style="display:flex; justify-content:space-between;">
+                            <span class="card-title">{rule}</span>
+                            <span class="{s_class}">{s_icon}</span>
+                        </div>
+                        <small><b>Requirement:</b> {desc}</small>
+                    </div>
+                """, unsafe_allow_html=True)
+
+            with st.expander("View Raw Data (Check for MRP here)"):
+                st.write(detected_texts)
