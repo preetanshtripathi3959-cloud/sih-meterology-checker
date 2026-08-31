@@ -7,156 +7,122 @@ from PIL import Image
 import re
 from rapidfuzz import fuzz
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="AI Metrology Inspector", layout="wide", page_icon="⚖️")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="AI Metrology Inspector", layout="wide")
 
-# --- CUSTOM UI STYLING ---
+# --- UI STYLING ---
 st.markdown("""
     <style>
-    .report-card { 
-        background: #ffffff; padding: 20px; border-radius: 12px; 
-        border-left: 10px solid #004085; color: #111111 !important;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 15px;
-    }
-    .status-pass { color: #28a745 !important; font-weight: bold; }
-    .status-fail { color: #dc3545 !important; font-weight: bold; }
-    .card-title { color: #004085 !important; font-weight: bold; font-size: 1.2em; }
+    .report-card { background: white; padding: 15px; border-radius: 10px; border-left: 10px solid #004085; color: black; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    .status-pass { color: green; font-weight: bold; }
+    .status-fail { color: red; font-weight: bold; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- LOAD AI MODELS ---
+# --- LOAD MODELS ---
 @st.cache_resource
 def load_models():
-    # Detection: YOLOv8 (Trained on stickers - batch, stickers - label)
+    # Attempt to load your custom model
     try:
-        detector = YOLO('best.pt') 
-    except:
-        detector = YOLO('yolov8n.pt') # Fallback if best.pt is missing
+        # Check if best.pt exists in the root directory
+        import os
+        if os.path.exists('best.pt'):
+            detector = YOLO('best.pt')
+            model_type = "Custom (best.pt)"
+        else:
+            detector = YOLO('yolov8n.pt')
+            model_type = "Generic (yolov8n.pt)"
+    except Exception as e:
+        detector = YOLO('yolov8n.pt')
+        model_type = f"Error loading best.pt: {e}"
+        
+    reader = easyocr.Reader(['en'])
+    return detector, reader, model_type
+
+detector, reader, model_info = load_models()
+
+# Sidebar Debug Info
+st.sidebar.title("🛠️ AI Diagnostics")
+st.sidebar.write(f"**Model Loaded:** {model_info}")
+
+# --- COMPLIANCE LOGIC ---
+def check_compliance(text_list):
+    full_text = " ".join(text_list).lower()
     
-    # Recognition: EasyOCR (English + Hindi)
-    reader = easyocr.Reader(['en', 'hi'])
-    return detector, reader
-
-detector, reader = load_models()
-
-# --- LANGUAGE DICTIONARY ---
-with st.sidebar:
-    st.title("⚙️ Settings")
-    lang_choice = st.selectbox("Language / भाषा", ["English", "Hindi (हिन्दी)"])
-
-T = {
-    "English": {
-        "title": "⚖️ Compliance Dashboard",
-        "info": "Checking Legal Metrology Rules, 2011",
-        "scan": "Scan Product Label",
-        "mrp": "MRP & Tax Declaration",
-        "qty": "Net Quantity Check",
-        "date": "Mfg/Packing Date",
-        "pass": "PASSED ✅",
-        "fail": "VIOLATION ❌",
-        "req": "Requirement"
-    },
-    "Hindi (हिन्दी)": {
-        "title": "⚖️ अनुपालन डैशबोर्ड",
-        "info": "कानूनी मेट्रोलॉजी नियम, 2011 की जांच",
-        "scan": "लेबल स्कैन करें",
-        "mrp": "MRP और कर घोषणा",
-        "qty": "शुद्ध मात्रा की जांच",
-        "date": "निर्माण की तारीख",
-        "pass": "पास ✅",
-        "fail": "उल्लंघन ❌",
-        "req": "आवश्यकता"
-    }
-}
-L = T[lang_choice]
-
-# --- COMPLIANCE ENGINE ---
-def check_rules(extracted_text):
-    full_text = " ".join(extracted_text).lower()
+    # Using Fuzzy matching for better results
+    mrp_found = re.search(r"(mrp|rs|retail|price).?\d+", full_text)
+    tax_phrase = fuzz.partial_ratio("inclusive of all taxes", full_text) > 60
     
-    # Fuzzy Match for the mandatory phrase
-    mrp_phrase_score = fuzz.partial_ratio("inclusive of all taxes", full_text)
-    mrp_found = re.search(r"(?:mrp|rs|price)\.?\s?(\d+)", full_text)
-    
-    qty_found = re.search(r"(\d+\.?\d*)\s?(g|kg|ml|l|unit|n)", full_text)
-    date_found = re.search(r"(\d{2}/\d{2,4})|(\d{2}-\d{2,4})", full_text)
+    qty_found = re.search(r"(\d+)\s?(g|kg|ml|l|unit|n)", full_text)
+    date_found = re.search(r"\d{2}/\d{2,4}", full_text) or "pkd" in full_text or "mfd" in full_text
 
     return {
-        "MRP": (mrp_phrase_score > 75 and mrp_found, "Rule 6: Must include 'Inclusive of all taxes'"),
-        "QTY": (bool(qty_found), "Rule 7: Standard metric units (g, kg, ml, l) required"),
-        "DATE": (bool(date_found) or "pkd" in full_text or "mfd" in full_text, "Rule 9: Month & Year of packing required")
+        "MRP & Taxes": (mrp_found and tax_phrase, "Mandatory: MRP + 'Inclusive of all taxes'"),
+        "Net Quantity": (bool(qty_found), "Mandatory: Standard units (g, kg, ml, l)"),
+        "Mfg Date": (bool(date_found), "Mandatory: Month and Year of packing")
     }
 
-# --- MAIN INTERFACE ---
-st.title(L["title"])
-st.caption(L["info"])
-
-img_file = st.camera_input(L["scan"])
+# --- MAIN APP ---
+st.title("⚖️ Legal Metrology Compliance AI")
+img_file = st.camera_input("Scan Product Label")
 
 if img_file:
-    # Convert image for YOLO
+    # 1. Prepare Image
     image = Image.open(img_file)
-    img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    img_np = np.array(image)
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
-    with st.spinner("AI Pipeline Processing..."):
-        # 1. YOLO DETECTION (conf=0.15 for better sensitivity)
-        results = detector(img_bgr, conf=0.15)
+    with st.spinner("Analyzing..."):
+        # 2. YOLO DETECTION (Force sensitivity with conf=0.05)
+        results = detector(img_bgr, conf=0.05)
         detected_texts = []
         
-        # 2. CROP & OCR
+        # 3. OCR Stage
         if len(results[0].boxes) > 0:
+            st.sidebar.success(f"Detected {len(results[0].boxes)} zones!")
             for box in results[0].boxes:
-                cls_id = int(box.cls[0])
-                label_name = results[0].names[cls_id]
+                # Get class name
+                cls = int(box.cls[0])
+                name = results[0].names[cls]
+                conf = float(box.conf[0])
+                st.sidebar.write(f"Zone: {name} ({conf:.2f}%)")
                 
+                # Crop and OCR
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 crop = img_bgr[y1:y2, x1:x2]
                 
-                # Special enhancement for 'stickers - batch' (contains small text)
-                if "batch" in label_name:
-                    crop = cv2.detailEnhance(crop, sigma_s=10, sigma_r=0.15)
+                # Sharpness boost
+                crop = cv2.convertScaleAbs(crop, alpha=1.2, beta=10)
                 
-                ocr_out = reader.readtext(crop, detail=0)
-                detected_texts.extend(ocr_out)
+                txt = reader.readtext(crop, detail=0)
+                detected_texts.extend(txt)
         else:
-            # Fallback to full page OCR if YOLO misses
-            detected_texts = reader.readtext(img_bgr, detail=0)
+            st.sidebar.warning("No zones detected. Scanning entire image...")
+            detected_texts = reader.readtext(img_np, detail=0)
 
-        # 3. RULE ANALYSIS
-        final_results = check_rules(detected_texts)
-        
-        # 4. UI DISPLAY
+        # 4. RESULTS
         col1, col2 = st.columns([1, 1])
         
         with col1:
             st.subheader("AI Vision")
-            # --- FIX: Convert BGR to RGB for Streamlit ---
+            # FIX: Convert to RGB for Streamlit display
             annotated_frame = results[0].plot()
             annotated_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-            st.image(annotated_rgb, caption="Detected Zones", use_container_width=True)
+            st.image(annotated_rgb, use_container_width=True)
             
         with col2:
             st.subheader("Compliance Report")
-            
-            # Map keys to translated labels
-            ui_labels = {"MRP": L["mrp"], "QTY": L["qty"], "DATE": L["date"]}
-            
-            for key, (passed, desc) in final_results.items():
-                status_txt = L["pass"] if passed else L["fail"]
-                status_class = "status-pass" if passed else "status-fail"
-                
+            report = check_compliance(detected_texts)
+            for rule, (status, desc) in report.items():
+                st_color = "status-pass" if status else "status-fail"
+                st_icon = "✅" if status else "❌"
                 st.markdown(f"""
                     <div class="report-card">
-                        <div style="display:flex; justify-content:space-between;">
-                            <span class="card-title">{ui_labels[key]}</span>
-                            <span class="{status_class}">{status_txt}</span>
-                        </div>
-                        <div style="margin-top:8px; font-size:0.9em;">
-                            <b>{L['req']}:</b> {desc}
-                        </div>
+                        <b>{rule}</b><br>
+                        <span class="{st_color}">{st_icon} {"PASSED" if status else "VIOLATION"}</span><br>
+                        <small>{desc}</small>
                     </div>
                 """, unsafe_allow_html=True)
-
-    # Debugging Expandable
-    with st.expander("Show AI Raw Metadata"):
-        st.write(detected_texts)
+                
+        with st.expander("Detected Text (Raw)"):
+            st.write(detected_texts)
