@@ -24,107 +24,124 @@ st.markdown("""
     .report-card { background: white; padding: 15px; border-radius: 10px; border-left: 10px solid #004085; color: black; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
     .status-pass { color: #28a745 !important; font-weight: bold; }
     .status-fail { color: #dc3545 !important; font-weight: bold; }
-    .data-box { background: #e9ecef; padding: 5px 10px; border-radius: 5px; font-family: monospace; font-size: 0.9em; margin-top: 5px; display: inline-block; }
+    .card-title { color: #004085 !important; font-weight: bold; font-size: 1.1em; }
+    .debug-tag { background: #e9ecef; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.8em; margin-right: 5px; color: #333; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- MODELS ---
 @st.cache_resource
 def load_ai():
     model = YOLO('best.pt') if os.path.exists('best.pt') else YOLO('yolov8n.pt')
-    reader = easyocr.Reader(['en'], gpu=False) 
+    reader = easyocr.Reader(['en'], gpu=False)
     return model, reader
 
 detector, reader = load_ai()
 
-# --- OPTIMIZED FAST PROCESSING ---
-def fast_enhance(img):
+def repair_ocr_for_numbers(text):
+    # OCR often swaps numbers and letters on small bottles
+    # 5 -> S, 0 -> O, 1 -> I/l, 8 -> B
+    text = text.lower()
+    mapping = {'s': '5', 'o': '0', 'i': '1', 'l': '1', 'b': '8', 'z': '2'}
+    # Only swap if the word looks like it should be a number
+    if any(char.isdigit() for char in text) or len(text) <= 4:
+        for char, num in mapping.items():
+            text = text.replace(char, num)
+    return text
+
+def enhance_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Resize to 1.5x (Faster than 3x, but keeps detail)
-    gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
-    return gray
+    # 3x Zoom
+    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_LANCZOS4)
+    # Adaptive thresholding
+    enhanced = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    return enhanced
 
-# --- COMPLIANCE LOGIC WITH RESULT EXTRACTION ---
-def run_compliance_analysis(extracted_list):
-    full_blob = " ".join(extracted_list).lower()
+def check_compliance_ultra_flexible(extracted_list):
+    # Join text and repair common errors
+    raw_blob = " ".join(extracted_list).lower()
     
-    # 1. Price Extraction
-    mrp_match = re.search(r"(?:mrp|rs|price|₹)\.?\s?(\d+(?:\.\d+)?)", full_blob)
-    tax_score = fuzz.partial_ratio("inclusive of all taxes", full_blob)
-    mrp_pass = (mrp_match is not None) and (tax_score > 50)
+    # 1. PRICE DETECTION (More aggressive)
+    # Look for any currency marker OR the word 'mrp'
+    price_marker = any(x in raw_blob for x in ['mrp', 'rs', 'price', 'retail', '₹', 'r5'])
+    # Look for any number that looks like a price (e.g., 500, 500.00, 500-)
+    digits_found = re.search(r"\d{2,}", repair_ocr_for_numbers(raw_blob))
+    price_pass = price_marker and digits_found
 
-    # 2. Quantity Extraction
-    qty_match = re.search(r"(\d+\.?\d*)\s?(ml|g|kg|l|unit|n|pcs|gm)", full_blob)
-    
-    # 3. Date Extraction
-    date_match = re.search(r"(\d{2}[/\-\.]\d{2,4})", full_blob)
+    # 2. TAX DETECTION (If it sees 'incl' or 'tax', it passes)
+    tax_score = fuzz.partial_ratio("inclusive of all taxes", raw_blob)
+    tax_fragments = ["incl", "tax", "taxe", "inc", "all"]
+    found_frags = [f for f in tax_fragments if f in raw_blob]
+    tax_pass = (tax_score > 45) or (len(found_frags) >= 1)
 
-    # Compile Results
-    report = {
-        "MRP & Taxes": (bool(mrp_pass), f"Price: {mrp_match.group(0) if mrp_match else 'Not Found'}"),
-        "Net Quantity": (bool(qty_match), f"Qty: {qty_match.group(0) if qty_match else 'Not Found'}"),
-        "Mfg Date": (bool(date_match), f"Date: {date_match.group(0) if date_match else 'Not Found'}")
-    }
-    return report, full_blob
+    # 3. QTY & DATE
+    # Look for numbers near ml, g, kg
+    qty_pass = re.search(r"\d+\s?(ml|g|kg|l|n|unit|pcs|gm)", raw_blob)
+    date_pass = re.search(r"(\d{2}[/\-\.]\d{2,4})", raw_blob) or "mfg" in raw_blob or "pkd" in raw_blob
 
-# --- MAIN UI ---
-st.title("⚖️ Legal Metrology: Smart Inspector")
-st.write("Fast Automated Compliance for Packaged Commodities.")
+    return {
+        "MRP & Price": (bool(price_pass), "MRP/Rs keyword AND price digits"),
+        "Tax Declaration": (bool(tax_pass), "Mandatory 'Inclusive of all taxes' phrase"),
+        "Net Quantity": (bool(qty_pass), "Weight/Volume (e.g. 50ml)"),
+        "Mfg/Pkd Date": (bool(date_pass), "Month/Year of packing")
+    }, found_frags, digits_found.group(0) if digits_found else "None"
+
+# --- UI ---
+st.title("🛡️ Legal Metrology: Smart Inspector")
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    conf_level = st.slider("Sensitivity", 0.01, 1.0, 0.15)
 
 img_file = st.camera_input("Scan Label")
 
 if img_file:
-    # 1. LOAD & RESIZE (Speed Booster)
-    raw_image = ImageOps.exif_transpose(Image.open(img_file))
-    img_np = np.array(raw_image)
-    h, w = img_np.shape[:2]
-    # Resize input to 800px width (Perfect balance of speed/accuracy)
-    img_np = cv2.resize(img_np, (800, int(h * 800 / w)))
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    image = ImageOps.exif_transpose(Image.open(img_file))
+    img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     
-    with st.spinner("Analyzing Components..."):
-        # 2. YOLO Inference
-        results = detector(img_bgr, conf=0.10)
+    with st.spinner("AI Analysis..."):
+        results = detector(img_bgr, conf=conf_level)
         detected_texts = []
         
-        # 3. Smart OCR Logic
+        # Zone OCR
         if len(results[0].boxes) > 0:
             for box in results[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                x1, y1, x2, y2 = max(0, x1-15), max(0, y1-15), min(img_bgr.shape[1], x2+15), min(img_bgr.shape[0], y2+15)
+                # Huge padding to grab surrounding context
+                x1, y1, x2, y2 = max(0, x1-40), max(0, y1-40), min(img_bgr.shape[1], x2+40), min(img_bgr.shape[0], y2+40)
                 crop = img_bgr[y1:y2, x1:x2]
-                # Paragraph mode grouping for speed
-                txt = reader.readtext(fast_enhance(crop), detail=0, paragraph=True)
+                txt = reader.readtext(enhance_image(crop), detail=0)
                 detected_texts.extend(txt)
         
-        # Always run one fast full-page scan as backup
-        detected_texts.extend(reader.readtext(fast_enhance(img_bgr), detail=0, paragraph=True))
+        # Fallback Full Scan
+        detected_texts.extend(reader.readtext(enhance_image(img_bgr), detail=0))
 
-        # 4. RESULTS ENGINE
-        report, raw_text = run_compliance_analysis(detected_texts)
-
-        # 5. UI DISPLAY
-        col_vis, col_rep = st.columns(2)
-        
-        with col_vis:
-            st.subheader("AI Vision")
-            # YOLO BGR to RGB
-            annotated_frame = results[0].plot()
-            st.image(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+        col_v, col_r = st.columns(2)
+        with col_v:
+            st.image(cv2.cvtColor(results[0].plot(), cv2.COLOR_BGR2RGB), use_container_width=True)
             
-        with col_rep:
-            st.subheader("Compliance Report")
-            for rule, (status, data_found) in report.items():
+        with col_r:
+            report, fragments, price_val = check_compliance_ultra_flexible(detected_texts)
+            
+            # RESULTS DASHBOARD
+            st.write(f"**Detected Price Value:** `{price_val}`")
+            if fragments:
+                tags = "".join([f'<span class="debug-tag">{f.upper()}</span>' for f in fragments])
+                st.markdown(f"**Detected Tax Tokens:** {tags}", unsafe_allow_html=True)
+
+            st.divider()
+
+            for rule, (status, desc) in report.items():
                 s_icon = "✅ PASS" if status else "❌ FAIL"
                 s_class = "status-pass" if status else "status-fail"
-                
                 st.markdown(f"""
                     <div class="report-card">
-                        <b>{rule}</b>: <span class="{s_class}">{s_icon}</span><br>
-                        <div class="data-box">{data_found}</div>
+                        <div style="display:flex; justify-content:space-between;">
+                            <span class="card-title">{rule}</span>
+                            <span class="{s_class}">{s_icon}</span>
+                        </div>
+                        <small><b>Requirement:</b> {desc}</small>
                     </div>
                 """, unsafe_allow_html=True)
-            
-            # Show the raw text found for judges
-            with st.expander("Show Extracted Raw Text"):
-                st.write(raw_text)
+
+            with st.expander("View Raw Data (Check for MRP here)"):
+                st.write(detected_texts)
